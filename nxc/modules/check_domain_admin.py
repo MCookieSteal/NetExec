@@ -10,6 +10,21 @@ class NXCModule:
     """
     Module to check if the authenticated user is a Domain Administrator
     and retrieve the krbtgt hash if they are.
+    
+    This module performs two main functions:
+    1. Checks if the authenticated user is a member of the Domain Admins group (RID 512)
+    2. If they are a Domain Admin, retrieves and displays the krbtgt account's NTLM hash
+    
+    Requirements:
+    - SMB connection with administrative privileges
+    - Domain Controller access for SAMR and NTDS operations
+    
+    Usage:
+        nxc smb <target> -u <username> -p <password> -M check_domain_admin
+    
+    Output:
+    - Displays whether the user is a Domain Administrator
+    - If Domain Admin, displays the krbtgt NTLM hash
     """
 
     name = "check_domain_admin"
