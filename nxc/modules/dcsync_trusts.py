@@ -1,10 +1,10 @@
-from impacket.dcerpc.v5 import samr, transport
+from impacket.dcerpc.v5 import samr, transport, lsat, lsad
 from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE, RPC_C_AUTHN_LEVEL_PKT_PRIVACY
+from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
 from impacket.examples.secretsdump import RemoteOperations, NTDSHashes
 from contextlib import suppress
 import traceback
 from nxc.helpers.misc import CATEGORY, validate_ntlm
-from nxc.parsers.ldap_results import parse_result_attributes
 
 
 class NXCModule:
@@ -16,11 +16,11 @@ class NXCModule:
     2. If Domain Admin, performs a full DCSync against the DC and saves to a txt file
     3. Displays the krbtgt user hash (NTLM) on screen
     4. Displays hashes of trust accounts (associated domain hashes) if they exist
-    5. Enumerates and displays domain trust relationships
+    5. Enumerates and displays domain trust relationships via LSA RPC over SMB
     
     Requirements:
     - SMB connection with administrative privileges
-    - Domain Controller access for SAMR and NTDS operations
+    - Domain Controller access for SAMR, NTDS, and LSA operations
     
     Usage:
         nxc smb <dc_ip> -u <username> -p <password> -M dcsync_trusts
@@ -31,7 +31,7 @@ class NXCModule:
       - Performs full DCSync and saves to file
       - Displays krbtgt NTLM hash
       - Displays trust account hashes
-      - Displays domain trust relationships
+      - Displays domain trust relationships (via LSA RPC, not LDAP)
     """
 
     name = "dcsync_trusts"
@@ -243,101 +243,107 @@ class NXCModule:
             context.log.debug(traceback.format_exc())
 
     def enumerate_trusts(self, context, connection):
-        """Enumerate domain trust relationships"""
+        """Enumerate domain trust relationships using LSA RPC over SMB"""
         try:
-            context.log.info("Enumerating domain trust relationships...")
+            context.log.info("Enumerating domain trust relationships via LSA RPC...")
             
-            # We need to use LDAP for trust enumeration
-            # Import here to avoid circular dependencies
-            from impacket.ldap import ldap as ldap_impacket
-            from impacket.ldap import ldapasn1 as ldapasn1_impacket
-            
-            # Create LDAP connection
+            # Create RPC connection to LSARPC
             try:
-                ldap_conn = ldap_impacket.LDAPConnection(f"ldap://{connection.kdcHost}")
-                if connection.kerberos:
-                    ldap_conn.kerberosLogin(
-                        connection.username,
-                        connection.password,
-                        connection.domain,
-                        connection.lmhash,
-                        connection.nthash,
-                        connection.aesKey,
-                        connection.kdcHost
-                    )
-                else:
-                    ldap_conn.login(
-                        connection.username,
-                        connection.password,
-                        connection.domain,
-                        connection.lmhash,
-                        connection.nthash
-                    )
+                string_binding = fr"ncacn_np:{connection.host}[\pipe\lsarpc]"
+                dce = self.get_dce_rpc(connection.host, string_binding, lsat.MSRPC_UUID_LSAT, connection)
             except Exception as e:
-                context.log.fail(f"Failed to establish LDAP connection: {e}")
+                context.log.fail(f"Failed to connect to LSARPC: {e}")
+                context.log.debug(traceback.format_exc())
                 return
             
-            # Search for trusted domains
-            search_filter = "(objectClass=trustedDomain)"
-            attributes = ["name", "trustDirection", "trustType", "trustAttributes", "flatName"]
-            
+            # Open LSA policy handle
             try:
-                resp = ldap_conn.search(
-                    searchFilter=search_filter,
-                    attributes=attributes,
-                    sizeLimit=0
-                )
+                resp = lsad.hLsarOpenPolicy2(dce, MAXIMUM_ALLOWED | lsat.POLICY_LOOKUP_NAMES)
+                policy_handle = resp["PolicyHandle"]
             except Exception as e:
-                context.log.fail(f"Failed to query trusts: {e}")
+                context.log.fail(f"Failed to open LSA policy: {e}")
+                context.log.debug(traceback.format_exc())
                 return
             
-            # Parse results
-            trusts_found = 0
-            for item in resp:
-                if isinstance(item, ldapasn1_impacket.SearchResultEntry) is not True:
-                    continue
-                    
+            # Enumerate trusted domains
+            try:
+                resp = lsad.hLsarEnumerateTrustedDomainsEx(dce, policy_handle)
+                trusts = resp["EnumerationBuffer"]["EnumerationBuffer"]
+            except Exception as e:
+                context.log.fail(f"Failed to enumerate trusted domains: {e}")
+                context.log.debug(traceback.format_exc())
+                # Try closing the policy handle
                 try:
-                    trust_info = {}
-                    for attribute in item["attributes"]:
-                        attr_type = str(attribute["type"])
-                        if len(attribute["vals"]) > 0:
-                            attr_value = attribute["vals"][0]
-                            if isinstance(attr_value, ldapasn1_impacket.LDAPSTRING):
-                                trust_info[attr_type] = str(attr_value)
-                            else:
-                                trust_info[attr_type] = int(attr_value)
+                    lsad.hLsarClose(dce, policy_handle)
+                except Exception:
+                    pass
+                return
+            
+            # Parse and display trusts
+            trusts_found = 0
+            for trust in trusts:
+                try:
+                    trusts_found += 1
+                    trust_name = trust["Name"]["Buffer"] if trust["Name"] else "Unknown"
+                    trust_flat_name = trust["FlatName"]["Buffer"] if trust["FlatName"] else "Unknown"
+                    trust_direction = trust["TrustDirection"]
+                    trust_type = trust["TrustType"]
+                    trust_attributes = trust["TrustAttributes"]
                     
-                    if "name" in trust_info:
-                        trusts_found += 1
-                        trust_name = trust_info.get("name", "Unknown")
-                        trust_flat_name = trust_info.get("flatName", "Unknown")
-                        trust_direction = trust_info.get("trustDirection", 0)
-                        trust_type = trust_info.get("trustType", 0)
-                        
-                        # Convert trust direction to text
-                        direction_text = {
-                            0: "Disabled",
-                            1: "Inbound",
-                            2: "Outbound",
-                            3: "Bidirectional",
-                        }.get(trust_direction, "Unknown")
-                        
-                        # Convert trust type to text
-                        trust_type_text = {
-                            1: "Windows NT",
-                            2: "Active Directory",
-                            3: "Kerberos",
-                            4: "Unknown",
-                        }.get(trust_type, "Unknown")
-                        
-                        context.log.highlight(f"Trust: {trust_name} ({trust_flat_name})")
-                        context.log.highlight(f"  Direction: {direction_text}")
-                        context.log.highlight(f"  Type: {trust_type_text}")
-                        
+                    # Convert trust direction to text
+                    direction_text = {
+                        0: "Disabled",
+                        1: "Inbound",
+                        2: "Outbound",
+                        3: "Bidirectional",
+                    }.get(trust_direction, f"Unknown ({trust_direction})")
+                    
+                    # Convert trust type to text
+                    trust_type_text = {
+                        1: "Windows NT (Downlevel)",
+                        2: "Active Directory (Uplevel)",
+                        3: "MIT Kerberos",
+                        4: "DCE",
+                    }.get(trust_type, f"Unknown ({trust_type})")
+                    
+                    # Parse trust attributes
+                    trust_attr_flags = []
+                    if trust_attributes & 0x1:
+                        trust_attr_flags.append("Non-Transitive")
+                    if trust_attributes & 0x2:
+                        trust_attr_flags.append("Uplevel-Only")
+                    if trust_attributes & 0x4:
+                        trust_attr_flags.append("Quarantined")
+                    if trust_attributes & 0x8:
+                        trust_attr_flags.append("Forest-Transitive")
+                    if trust_attributes & 0x10:
+                        trust_attr_flags.append("Cross-Organization")
+                    if trust_attributes & 0x20:
+                        trust_attr_flags.append("Within-Forest")
+                    if trust_attributes & 0x40:
+                        trust_attr_flags.append("Treat-As-External")
+                    if trust_attributes & 0x80:
+                        trust_attr_flags.append("Uses-RC4")
+                    
+                    trust_attr_text = ", ".join(trust_attr_flags) if trust_attr_flags else "None"
+                    
+                    # Display trust information
+                    context.log.highlight(f"Trust: {trust_name}")
+                    context.log.highlight(f"  Flat Name: {trust_flat_name}")
+                    context.log.highlight(f"  Direction: {direction_text}")
+                    context.log.highlight(f"  Type: {trust_type_text}")
+                    context.log.highlight(f"  Attributes: {trust_attr_text}")
+                    
                 except Exception as e:
                     context.log.debug(f"Error parsing trust entry: {e}")
+                    context.log.debug(traceback.format_exc())
                     continue
+            
+            # Close policy handle
+            try:
+                lsad.hLsarClose(dce, policy_handle)
+            except Exception as e:
+                context.log.debug(f"Error closing LSA policy handle: {e}")
             
             if trusts_found == 0:
                 context.log.info("No trust relationships found")
