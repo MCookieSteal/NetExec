@@ -232,16 +232,16 @@ class NXCModule:
             # Display results
             context.log.success(f"DCSync completed! {len(self.all_hashes)} hashes dumped to {output_file}.ntds")
             
-            # Display krbtgt hash
+            # Display krbtgt hash with domain name
             if self.krbtgt_hash:
-                context.log.success("krbtgt account hash:")
-                context.log.highlight(f"  {self.krbtgt_hash}")
+                # Get domain name from connection
+                domain_name = connection.domain
+                context.log.info(f"krbtgt hash from {domain_name}: {self.krbtgt_hash}")
             else:
                 context.log.fail("krbtgt hash not found")
             
             # Display trust account hashes with trust information
             if self.trust_hashes:
-                context.log.success(f"Found {len(self.trust_hashes)} trust account hash(es):")
                 for trust_hash in self.trust_hashes:
                     # Extract account name from hash
                     account_name = trust_hash.split(":")[0]
@@ -258,12 +258,12 @@ class NXCModule:
                             matching_trust = trust_info
                             break
                     
-                    # Display hash with trust info
-                    context.log.highlight(f"  {trust_hash}")
+                    # Display hash with trust domain name
                     if matching_trust:
                         trust_name = matching_trust.get("name", "Unknown")
-                        direction = matching_trust.get("direction", "Unknown")
-                        context.log.highlight(f"    → Trust with: {trust_name} (Direction: {direction})")
+                        context.log.info(f"Trust hash from {trust_name}: {trust_hash}")
+                    else:
+                        context.log.info(f"Trust hash: {trust_hash}")
             else:
                 context.log.info("No trust account hashes found")
                 
@@ -404,17 +404,15 @@ class NXCModule:
                     if trust_flat_name and trust_flat_name != "Unknown":
                         trust_info_list.append(trust_info)
                     
-                    # Display trust relationship clearly with arrow
-                    context.log.success(f"═══ Trust Relationship {trusts_found} ═══")
-                    context.log.highlight(f"  {current_domain} {direction_arrow} {trust_name}")
-                    context.log.highlight(f"  Trust Type: {trust_type_text}")
-                    context.log.highlight(f"  Direction: {direction_text}")
+                    # Display trust relationship clearly - simpler format like raisechild
+                    context.log.info(f"Current Domain: {current_domain}")
                     if current_domain_sid:
-                        context.log.highlight(f"  Current Domain SID: {current_domain_sid}")
+                        context.log.info(f"Current Domain SID: {current_domain_sid}")
+                    context.log.info(f"Trust Domain: {trust_name} ({trust_flat_name})")
                     if trust_sid:
-                        context.log.highlight(f"  Trust Domain SID: {trust_sid}")
-                    context.log.highlight(f"  Flat Name: {trust_flat_name}")
-                    context.log.highlight(f"  Attributes: {trust_attr_text}")
+                        context.log.info(f"Trust Domain SID: {trust_sid}")
+                    context.log.info(f"Trust Direction: {direction_text} {direction_arrow}")
+                    context.log.info(f"Trust Type: {trust_type_text}")
                     
                 except Exception as e:
                     context.log.debug(f"Error parsing trust entry: {e}")
