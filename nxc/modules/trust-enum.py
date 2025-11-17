@@ -328,15 +328,32 @@ class NXCModule:
                     self.krbtgt_hash = secret
                     self.context.log.highlight(f"    [KRBTGT] {secret}")
                 
-                # Capture trust account hashes (accounts ending with $)
-                # Trust accounts typically have format: DOMAIN$DOMAIN$
-                elif "$:" in secret and secret.count("$") >= 1:
-                    # Check if it's a trust account (usually contains domain name)
-                    if any(trust['flat_name'].lower() in secret_lower or 
-                          trust['name'].lower().split('.')[0] in secret_lower 
-                          for trust in self.trust_data if trust['flat_name'] or trust['name']):
-                        self.trust_hashes.append(secret)
-                        self.context.log.highlight(f"    [TRUST] {secret}")
+                # Capture trust account hashes
+                # Trust accounts end with $ and match trusted domain names
+                # Format is typically: DOMAIN\TRUSTEDDOMAIN$:...
+                elif "$:" in secret:
+                    # Extract the account name (part before the colon)
+                    account_part = secret.split(":")[0] if ":" in secret else secret
+                    # Get just the username part (after \ if present)
+                    username = account_part.split("\\")[-1] if "\\" in account_part else account_part
+                    
+                    # Check if username matches any trust domain (case-insensitive)
+                    # Trust accounts are named after the trusted domain
+                    for trust in self.trust_data:
+                        trust_names = []
+                        if trust['flat_name']:
+                            trust_names.append(trust['flat_name'].lower())
+                        if trust['name']:
+                            # Add both full domain and first part (e.g., "child" from "child.parent.com")
+                            trust_names.append(trust['name'].lower())
+                            trust_names.append(trust['name'].lower().split('.')[0])
+                        
+                        # Check if the account name (without $) matches a trust domain
+                        username_base = username.rstrip('$').lower()
+                        if username_base in trust_names or any(name in username_base for name in trust_names):
+                            self.trust_hashes.append(secret)
+                            self.context.log.highlight(f"    [TRUST] {secret}")
+                            break
 
             ntds = NTDSHashes(
                 None,
