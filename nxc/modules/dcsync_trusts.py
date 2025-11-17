@@ -283,8 +283,6 @@ class NXCModule:
         """Enumerate domain trust relationships using LSA RPC over SMB"""
         trust_info_list = []
         try:
-            context.log.info("Enumerating domain trust relationships via LSA RPC...")
-            
             # Get current domain name
             current_domain = connection.domain
             
@@ -334,6 +332,7 @@ class NXCModule:
                 return trust_info_list
             
             # Parse and display trusts
+            context.log.success("Checking for trust relationships...")
             trusts_found = 0
             for trust in trusts:
                 try:
@@ -430,6 +429,8 @@ class NXCModule:
             
             if trusts_found == 0:
                 context.log.info("No trust relationships found")
+            else:
+                context.log.success(f"Total: {trusts_found} trust relationship(s) found")
             
             return trust_info_list
                 
