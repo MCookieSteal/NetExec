@@ -288,6 +288,19 @@ class NXCModule:
             # Get current domain name
             current_domain = connection.domain
             
+            # Get current domain SID
+            current_domain_sid = None
+            try:
+                string_binding_samr = fr"ncacn_np:{connection.kdcHost}[\pipe\samr]"
+                dce_samr = self.get_dce_rpc(connection.kdcHost, string_binding_samr, samr.MSRPC_UUID_SAMR, connection)
+                server_handle = samr.hSamrConnect2(dce_samr)["ServerHandle"]
+                domain_name = samr.hSamrEnumerateDomainsInSamServer(dce_samr, server_handle)["Buffer"]["Buffer"][0]["Name"]
+                resp = samr.hSamrLookupDomainInSamServer(dce_samr, server_handle, domain_name)
+                current_domain_sid = resp["DomainId"].formatCanonical()
+                context.log.debug(f"Current domain SID: {current_domain_sid}")
+            except Exception as e:
+                context.log.debug(f"Failed to get current domain SID: {e}")
+            
             # Create RPC connection to LSARPC
             try:
                 string_binding = fr"ncacn_np:{connection.host}[\pipe\lsarpc]"
@@ -331,13 +344,24 @@ class NXCModule:
                     trust_type = trust["TrustType"]
                     trust_attributes = trust["TrustAttributes"]
                     
-                    # Convert trust direction to text
-                    direction_text = {
-                        0: "Disabled",
-                        1: "Inbound",
-                        2: "Outbound",
-                        3: "Bidirectional",
-                    }.get(trust_direction, f"Unknown ({trust_direction})")
+                    # Extract SID
+                    trust_sid = None
+                    if trust.get("Sid"):
+                        try:
+                            trust_sid = trust["Sid"].formatCanonical()
+                        except Exception:
+                            trust_sid = None
+                    
+                    # Convert trust direction to text and arrow
+                    direction_map = {
+                        0: ("Disabled", "-X-"),
+                        1: ("Inbound", "<--"),
+                        2: ("Outbound", "-->"),
+                        3: ("Bidirectional", "<-->"),
+                    }
+                    direction_text, direction_arrow = direction_map.get(
+                        trust_direction, (f"Unknown ({trust_direction})", "<??>")
+                    )
                     
                     # Convert trust type to text
                     trust_type_text = {
@@ -373,18 +397,24 @@ class NXCModule:
                         "name": trust_name,
                         "flat_name": trust_flat_name,
                         "direction": direction_text,
+                        "direction_arrow": direction_arrow,
                         "type": trust_type_text,
-                        "attributes": trust_attr_text
+                        "attributes": trust_attr_text,
+                        "sid": trust_sid
                     }
                     if trust_flat_name and trust_flat_name != "Unknown":
                         trust_info_list.append(trust_info)
                     
-                    # Display trust relationship clearly
-                    context.log.success(f"Trust relationship {trusts_found}:")
-                    context.log.highlight(f"  {current_domain} ←→ {trust_name}")
-                    context.log.highlight(f"  Flat Name: {trust_flat_name}")
+                    # Display trust relationship clearly with arrow
+                    context.log.success(f"═══ Trust Relationship {trusts_found} ═══")
+                    context.log.highlight(f"  {current_domain} {direction_arrow} {trust_name}")
+                    context.log.highlight(f"  Trust Type: {trust_type_text}")
                     context.log.highlight(f"  Direction: {direction_text}")
-                    context.log.highlight(f"  Type: {trust_type_text}")
+                    if current_domain_sid:
+                        context.log.highlight(f"  Current Domain SID: {current_domain_sid}")
+                    if trust_sid:
+                        context.log.highlight(f"  Trust Domain SID: {trust_sid}")
+                    context.log.highlight(f"  Flat Name: {trust_flat_name}")
                     context.log.highlight(f"  Attributes: {trust_attr_text}")
                     
                 except Exception as e:
